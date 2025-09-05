@@ -1,1 +1,1 @@
-###RTGS-Style AI Analyst
+### RTGS-Style AI Analyst
