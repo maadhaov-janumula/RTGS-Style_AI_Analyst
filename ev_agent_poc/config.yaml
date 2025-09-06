@@ -1,0 +1,16 @@
+data:
+  # Point this to your CSV. Filename may vary — code will parse _MM_YYYY anywhere in it.
+  path: "data/TG-SPDCL_consumption_detail_ev_charging_stations_08_2025.csv"
+
+  # Logical column names your app expects
+  time_col: "month"          # will be created from filename if not in CSV
+  energy_col: "units"        # in your CSV, energy is "units" (kWh)
+
+  # Best available geographic/station identifier(s) in your data
+  geo_cols: ["area"]
+
+cleaning:
+  fill_missing_energy: 0
+  dedupe_keys: ["area", "month"]
+
+outputs_dir: "outputs/"

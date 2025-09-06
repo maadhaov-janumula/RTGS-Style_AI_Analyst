@@ -64,7 +64,7 @@ The goal of this project is to analyze **EV charging station consumption data** 
 
 * **Data Scope**:
 
-  * **Time Range**: Focus on recent years (e.g., 2020–2025) to capture trends and make actionable recommendations.
+  * **Time Range**: Focus on recent years (e.g., 2023–2025) to capture trends and make actionable recommendations.
   * **Geographical Scope**: Primarily urban centers (Hyderabad, Warangal, Nizamabad) with potential expansion into rural areas if data supports.
 
 ---
