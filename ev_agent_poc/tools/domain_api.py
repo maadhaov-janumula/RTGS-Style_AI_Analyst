@@ -1,9 +1,18 @@
-# tools/domain_api.py
 import time
-import pandas as pd
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
+import pandas as pd
+from pathlib import Path
+from pydantic import BaseModel, Field
+from langchain_core.tools import StructuredTool
+
+# ---------------- Small utility ----------------
+def _now_ms() -> float:
+    return time.perf_counter() * 1000
+
+
+# ---------------- ToolCallLog ----------------
 @dataclass
 class ToolCallLog:
     name: str
@@ -12,12 +21,11 @@ class ToolCallLog:
     out_shape: Optional[str] = None
     note: Optional[str] = None
 
-def _now_ms() -> float:
-    """Returns the current time in milliseconds."""
-    return time.perf_counter() * 1000
 
 # ---------------- Core helpers ----------------
-def quality_report(df: pd.DataFrame, energy_col: str, dedupe_keys: List[str]) -> (dict, ToolCallLog):
+def quality_report(
+    df: pd.DataFrame, energy_col: str, dedupe_keys: List[str]
+) -> Tuple[dict, ToolCallLog]:
     """Generate a report on the data quality (e.g., missing values, duplicates)."""
     t0 = _now_ms()
     n_rows = len(df)
@@ -27,7 +35,8 @@ def quality_report(df: pd.DataFrame, energy_col: str, dedupe_keys: List[str]) ->
     if energy_col in df.columns:
         s = df[energy_col].dropna()
         if len(s) > 0:
-            z = (s - s.mean()) / (s.std(ddof=0) if s.std(ddof=0) else 1)
+            std = s.std(ddof=0)
+            z = (s - s.mean()) / (std if std else 1)
             outliers = int((abs(z) > 3).sum())
     report = {
         "rows": n_rows,
@@ -39,132 +48,182 @@ def quality_report(df: pd.DataFrame, energy_col: str, dedupe_keys: List[str]) ->
         name="quality_report",
         args={"energy_col": energy_col, "dedupe_keys": dedupe_keys},
         ms=_now_ms() - t0,
-        out_shape="dict"
+        out_shape="dict",
     )
     return report, log
 
-def standardize(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize the dataset (e.g., column names, missing time columns, etc.)."""
+
+# ---------------- Domain functions (DataFrame in, DataFrame/values out) ----------------
+def standardize_tool(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize the dataset (column names, month dtype, energy column)."""
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError(f"Expected a DataFrame, but got {type(df)} instead.")
+
+    df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    if 'month' not in df.columns:
-        # Inferred from file name or default
-        df['month'] = pd.to_datetime('2025-08-01')  # default if missing
+
+    # Month
+    if "month" not in df.columns:
+        df["month"] = pd.to_datetime("2025-08-01")  # default if missing
     else:
-        df['month'] = pd.to_datetime(df['month'], errors='coerce')
-    
-    if 'energy_kwh' not in df.columns and 'units' in df.columns:
-        df['energy_kwh'] = df['units']
-    df['energy_kwh'] = pd.to_numeric(df['energy_kwh'], errors="coerce")
+        df["month"] = pd.to_datetime(df["month"], errors="coerce")
 
-    if 'station_name' not in df.columns:
-        df['station_name'] = df.get('area', 'Unknown Station')
-    
+    # Energy -> energy_kwh
+    if "energy_kwh" not in df.columns and "units" in df.columns:
+        df["energy_kwh"] = df["units"]
+    if "energy_kwh" not in df.columns:
+        df["energy_kwh"] = pd.NA
+    df["energy_kwh"] = pd.to_numeric(df["energy_kwh"], errors="coerce")
+
+    # Station name
+    if "station_name" not in df.columns:
+        df["station_name"] = df.get("area", "Unknown Station")
+
     return df
 
-def clean(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean the dataset (e.g., remove duplicates, handle missing values)."""
-    df = df.drop_duplicates(subset=["station_name", "month"])  # dedupe by station_name and month
-    df['energy_kwh'] = df['energy_kwh'].fillna(0)  # fill missing energy with 0
+
+def clean_tool(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the dataset (dedupe, fill NA)."""
+    df = df.copy()
+    # dedupe by station_name + month if available
+    subset_cols = [c for c in ["station_name", "month"] if c in df.columns]
+    if subset_cols:
+        df = df.drop_duplicates(subset=subset_cols)
+    else:
+        df = df.drop_duplicates()
+
+    if "energy_kwh" in df.columns:
+        df["energy_kwh"] = df["energy_kwh"].fillna(0)
     return df
 
-# ---------------- INSIGHTS ----------------
-def compute_insights(df: pd.DataFrame) -> (float, pd.DataFrame, pd.DataFrame):
-    """Compute basic insights like total energy, top 5 stations, and under-utilized stations."""
-    total_energy = df['energy_kwh'].sum()
-    top5 = df.groupby('station_name')['energy_kwh'].sum().sort_values(ascending=False).head(5).reset_index()
-    underutilized = df[df['energy_kwh'] < 100]  # Stations with less than 100 kWh
+
+def compute_insights_tool(
+    df: pd.DataFrame,
+) -> Tuple[float, pd.DataFrame, pd.DataFrame]:
+    """Compute total energy, top5 stations, and under-utilized rows."""
+    if "energy_kwh" not in df.columns:
+        raise ValueError("Column 'energy_kwh' is required for insights.")
+    if "station_name" not in df.columns:
+        raise ValueError("Column 'station_name' is required for insights.")
+
+    total_energy = float(df["energy_kwh"].sum())
+    top5 = (
+        df.groupby("station_name", as_index=False)["energy_kwh"]
+        .sum()
+        .sort_values("energy_kwh", ascending=False)
+        .head(5)
+        .reset_index(drop=True)
+    )
+    # under-utilized threshold: <100 kWh (simple heuristic)
+    underutilized = df[df["energy_kwh"] < 100].copy()
     return total_energy, top5, underutilized
 
-def timeseries(df: pd.DataFrame, metric: str, time_col: str, group_by: Optional[List[str]] = None, filters: Optional[Dict[str, Any]] = None, agg: str = "sum") -> (pd.DataFrame, ToolCallLog):
-    """Aggregate the metric (e.g., energy_kwh) over time (e.g., monthly)."""
-    t0 = _now_ms()
-    data = df.copy()
-    
-    # Apply filters if provided
-    if filters:
-        for k, v in filters.items():
-            if k in data.columns:
-                if isinstance(v, list):
-                    data = data[data[k].isin(v)]
-                else:
-                    data = data[data[k] == v]
 
-    # Ensure time_col exists and convert to datetime if necessary
-    if time_col in data.columns:
-        data[time_col] = pd.to_datetime(data[time_col], errors='coerce')
-        data['_period'] = data[time_col].dt.to_period("M").dt.to_timestamp()
-    else:
-        data['_period'] = pd.NaT
-    
-    group_cols = ['_period'] + (group_by or [])
-    out = data.groupby(group_cols)[metric].agg(agg).reset_index()
+# ---------------- Agent-facing wrappers (accept a CSV path string) ----------------
+DATA_OUT_DIR = Path("outputs")
+DATA_OUT_DIR.mkdir(exist_ok=True)
 
-    log = ToolCallLog(
-        name="timeseries",
-        args={"metric": metric, "time_col": time_col, "group_by": group_by, "filters": filters, "agg": agg},
-        ms=_now_ms() - t0,
-        out_shape=f"{out.shape}"
-    )
-    return out, log
 
-def topk(df: pd.DataFrame, metric: str, by: str = "station_name", k: int = 5, filters: Optional[Dict[str, Any]] = None) -> (pd.DataFrame, ToolCallLog):
-    """Get the top k stations (or other categories) by the selected metric."""
-    t0 = _now_ms()
-    data = df.copy()
-    
-    if filters:
-        for kf, vf in filters.items():
-            if kf in data.columns:
-                if isinstance(vf, list):
-                    data = data[data[kf].isin(vf)]
-                else:
-                    data = data[data[kf] == vf]
-    
-    top_k = data.groupby(by)[metric].sum().sort_values(ascending=False).head(k).reset_index()
-    
-    log = ToolCallLog(
-        name="topk",
-        args={"metric": metric, "by": by, "k": k, "filters": filters},
-        ms=_now_ms() - t0,
-        out_shape=f"{top_k.shape}"
-    )
-    return top_k, log
+class PathInput(BaseModel):
+    csv_path: str = Field(..., description="Path to the CSV with EV usage data")
 
-def month_over_month(df: pd.DataFrame, metric: str, time_col: str, filters: Optional[Dict[str, Any]] = None) -> (dict, ToolCallLog):
-    """Compute the month-over-month change for a metric."""
-    t0 = _now_ms()
-    data = df.copy()
-    
-    # Apply filters if provided
-    if filters:
-        for k, v in filters.items():
-            if k in data.columns:
-                if isinstance(v, list):
-                    data = data[data[k].isin(v)]
-                else:
-                    data = data[data[k] == v]
-    
-    if time_col in data.columns:
-        data[time_col] = pd.to_datetime(data[time_col], errors='coerce')
-        data['_period'] = data[time_col].dt.to_period("M").dt.to_timestamp()
-    else:
-        data['_period'] = pd.Timestamp("1970-01-01")
-    
-    totals = data.groupby('_period')[metric].sum().sort_index()
-    if len(totals) == 0:
-        result = {"current_month": None, "prev_month": None, "current_total": 0.0, "prev_total": 0.0, "mom_pct": None}
-    else:
-        current_month = totals.index.max()
-        prev_month = current_month - pd.DateOffset(months=1)
-        current_total = float(totals.loc[current_month]) if current_month in totals.index else 0.0
-        prev_total = float(totals.loc[prev_month]) if prev_month in totals.index else 0.0
-        mom_pct = ((current_total - prev_total) / prev_total * 100.0) if prev_total else None
-        result = {"current_month": current_month.strftime("%Y-%m"), "prev_month": prev_month.strftime("%Y-%m") if prev_total else None, "current_total": current_total, "prev_total": prev_total, "mom_pct": mom_pct}
 
-    log = ToolCallLog(
-        name="month_over_month",
-        args={"metric": metric, "time_col": time_col, "filters": filters},
-        ms=_now_ms() - t0,
-        out_shape="dict"
-    )
-    return result, log
+def _standardize_from_path(csv_path: str) -> str:
+    df = pd.read_csv(csv_path)
+    df = standardize_tool(df)
+    out_path = DATA_OUT_DIR / "standardized.csv"
+    df.to_csv(out_path, index=False)
+    return str(out_path)
+
+
+def _clean_from_path(csv_path: str) -> str:
+    df = pd.read_csv(csv_path)
+    df = standardize_tool(df)
+    df = clean_tool(df)
+    out_path = DATA_OUT_DIR / "cleaned.csv"
+    df.to_csv(out_path, index=False)
+    return str(out_path)
+
+
+def _compute_from_path(csv_path: str) -> str:
+    df = pd.read_csv(csv_path)
+    df = standardize_tool(df)
+    df = clean_tool(df)
+    total_energy, top5, underutilized = compute_insights_tool(df)
+    top5_path = DATA_OUT_DIR / "top5.csv"
+    under_path = DATA_OUT_DIR / "underutilized.csv"
+    top5.to_csv(top5_path, index=False)
+    underutilized.to_csv(under_path, index=False)
+    return f"total_energy_kwh={total_energy:.0f};top5={top5_path};underutilized={under_path}"
+
+
+def _pipeline(csv_path: str) -> str:
+    """Standardize -> Clean -> Compute, and persist artifacts."""
+    try:
+        # Read the CSV file, ensuring no extra quotes or issues in path handling
+        csv_path = csv_path.strip("'")  # Remove any extra single quotes from the path
+        df = pd.read_csv(csv_path)
+        
+        # Standardize the data
+        df_std = standardize_tool(df)
+        std_path = DATA_OUT_DIR / "standardized.csv"
+        df_std.to_csv(std_path, index=False)
+
+        # Clean the data
+        df_clean = clean_tool(df_std)
+        clean_path = DATA_OUT_DIR / "cleaned.csv"
+        df_clean.to_csv(clean_path, index=False)
+
+        # Compute insights
+        total_energy, top5, underutilized = compute_insights_tool(df_clean)
+        top5_path = DATA_OUT_DIR / "top5.csv"
+        under_path = DATA_OUT_DIR / "underutilized.csv"
+        top5.to_csv(top5_path, index=False)
+        underutilized.to_csv(under_path, index=False)
+
+        # Return the paths and insights
+        return (
+            f"standardized={std_path};cleaned={clean_path};"
+            f"total_energy_kwh={total_energy:.0f};top5={top5_path};underutilized={under_path}"
+        )
+    
+    except FileNotFoundError as e:
+        return f"File not found: {e}"
+    except Exception as e:
+        return f"An error occurred: {e}"
+
+# ---------------- LangChain Tools (Structured) ----------------
+tools = [
+    StructuredTool.from_function(
+        name="StandardizeData",
+        func=_standardize_from_path,
+        args_schema=PathInput,
+        description="Standardize EV CSV columns/types/units given a CSV path.",
+    ),
+    StructuredTool.from_function(
+        name="CleanData",
+        func=_clean_from_path,
+        args_schema=PathInput,
+        description="Clean standardized EV CSV given a CSV path.",
+    ),
+    StructuredTool.from_function(
+        name="ComputeInsights",
+        func=_compute_from_path,
+        args_schema=PathInput,
+        description="Compute total energy, top stations, and under-utilized given a CSV path.",
+    ),
+    StructuredTool.from_function(
+        name="EVUsagePipeline",
+        func=_pipeline,
+        args_schema=PathInput,
+        description="Run Standardize -> Clean -> Compute in one go for a CSV path; returns file paths and metrics.",
+    ),
+]
+
+__all__ = [
+    "quality_report",
+    "standardize_tool",
+    "clean_tool",
+    "compute_insights_tool",
+    "tools",
+]
